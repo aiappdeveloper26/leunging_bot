@@ -14,7 +14,8 @@ Setup (see the README notes in chat):
   python daybook_bot.py
 """
 
-import os, sqlite3, time, json, random, asyncio, logging, datetime as dt
+import os, sqlite3, time, json, random, asyncio, logging, threading, datetime as dt
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -739,9 +740,33 @@ async def schedule_digest(app: Application, chat):
 
 async def on_startup(app: Application):
     init_db()
+    # Defensive: if a webhook was ever set for this token (e.g. by a previous
+    # deploy or a different bot framework), polling will conflict with it.
+    # Clearing it here is harmless if no webhook is set.
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:
+        log.warning("delete_webhook failed (continuing anyway): %s", e)
     for chat in all_user_ids():
         await schedule_digest(app, chat)
     log.info("Daybook ready. Rescheduled digests for %d users.", len(all_user_ids()))
+
+# ── health-check server (for Render's free Web Service tier) ────────────────
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"The Daybook is running.")
+    def log_message(self, *a, **k):
+        pass  # keep request logs out of the main log stream
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Health-check server listening on port %d (for Render).", port)
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -762,6 +787,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    start_health_server()
     log.info("Polling…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
