@@ -9,7 +9,7 @@ spaced-repetition schedule (SM-2). You can also review or quiz on demand.
 Setup (see the README notes in chat):
   pip install -r requirements.txt
   export TELEGRAM_BOT_TOKEN="123:ABC..."     # from @BotFather
-  export GROQ_API_KEY="gsk_..."              # from console.groq.com/keys
+  export GEMINI_API_KEY="AIza..."            # from aistudio.google.com/apikey
   export DAYBOOK_TZ="Asia/Tokyo"             # optional, defaults to UTC
   python daybook_bot.py
 """
@@ -27,10 +27,16 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("daybook")
 
-MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 TZ    = ZoneInfo(os.getenv("DAYBOOK_TZ", "UTC"))
 DB    = os.getenv("DAYBOOK_DB", "daybook.db")
 DAY   = 86400.0
+
+# Published free-tier ceiling for gemini-2.5-flash (requests/day). Used only
+# to show a "X / LIMIT" progress bar in /usage — Google does not expose a
+# live remaining-quota endpoint, so this is a local counter against a
+# constant. Override if your tier differs or Google changes the number.
+FREE_RPD_LIMIT = int(os.getenv("GEMINI_FREE_RPD", "1500"))
 
 PRESETS = [
     {"name": "Japanese words", "topic": "Japanese vocabulary", "level": "beginner",     "kind": "vocab", "lang": "Japanese"},
@@ -38,7 +44,82 @@ PRESETS = [
     {"name": "Finance terms",  "topic": "personal finance & investing", "level": "intermediate", "kind": "term"},
     {"name": "Python concepts","topic": "Python programming concepts",  "level": "intermediate", "kind": "concept"},
     {"name": "Big ideas",      "topic": "foundational ideas across science, history & philosophy", "level": "curious", "kind": "concept"},
+    {"name": "GARP RAI",       "topic": "the GARP Risk and AI (RAI) certificate curriculum — AI/ML fundamentals, "
+                                          "AI risk factors, model risk, governance frameworks (e.g. NIST AI RMF), "
+                                          "and responsible/ethical AI in financial risk management",
+     "level": "advanced", "kind": "lesson", "syllabus_key": "garp_rai"},
+    {"name": "Stocks & investing", "topic": "equity investing — financial statement analysis, valuation methods "
+                                             "(DCF, multiples), market mechanics, portfolio theory, and key ratios",
+     "level": "intermediate", "kind": "lesson", "syllabus_key": "stocks"},
 ]
+
+# Ordered topic lists for "lesson" decks that follow a real curriculum, so
+# daily cards march through the material in order rather than being picked
+# freely by the model. Loosely follows GARP's published RAI module structure
+# (AI & Risk Intro -> AI Tools & Techniques -> Risk Factors -> Responsible &
+# Ethical AI -> Data & AI Model Governance; the optional Case Studies module
+# is left out since it's untested / 0% exam weight) and a standard equity-
+# investing study sequence for Stocks & investing.
+SYLLABI = {
+    "garp_rai": [
+        # Module 1 — AI and Risk: Introduction & Overview
+        "History and evolution of AI and machine learning",
+        "Core AI/ML paradigms: supervised, unsupervised, and reinforcement learning",
+        "How large language models and generative AI work",
+        "Overview of AI-specific risk categories for organizations",
+        # Module 2 — AI Tools and Techniques
+        "Regression models and their use in business decision-making",
+        "Classification models: decision trees and logistic regression",
+        "Clustering and segmentation techniques",
+        "Neural networks and deep learning fundamentals",
+        "Natural language processing techniques",
+        "Time series forecasting with AI/ML",
+        "Model evaluation metrics: accuracy, precision, recall, AUC",
+        "Feature engineering and data preprocessing",
+        "Ensemble methods: random forests and boosting",
+        "Explainability and interpretability techniques (SHAP, LIME)",
+        # Module 3 — Risks and Risk Factors
+        "Model risk: overfitting, underfitting, and model drift",
+        "Data quality and bias risk in AI systems",
+        "AI-specific cybersecurity risks: adversarial attacks and data poisoning",
+        "Third-party and vendor risk in AI systems",
+        "Operational and concentration risk from AI adoption",
+        "Systemic risk implications of widespread AI use in finance",
+        # Module 4 — Responsible and Ethical AI
+        "AI ethics principles: fairness, accountability, and transparency",
+        "Algorithmic bias and discrimination in AI systems",
+        "Privacy considerations and regulation (e.g. GDPR) for AI",
+        "Human oversight and human-in-the-loop design",
+        # Module 5 — Data and AI Model Governance
+        "AI model governance frameworks and the model lifecycle",
+        "Model validation and independent review",
+        "The NIST AI Risk Management Framework (AI RMF)",
+        "Documentation, change management, and audit trails for AI models",
+        "The regulatory landscape for AI in financial services",
+    ],
+    "stocks": [
+        "How stock markets work: exchanges, market makers, and order types",
+        "Reading an income statement",
+        "Reading a balance sheet",
+        "Reading a cash flow statement",
+        "Key profitability ratios: ROE, ROA, and margins",
+        "Liquidity and solvency ratios: current ratio and debt-to-equity",
+        "The price-to-earnings (P/E) ratio: uses and limitations",
+        "Other valuation multiples: P/B, EV/EBITDA, and P/S",
+        "Discounted cash flow (DCF) valuation basics",
+        "Estimating a company's cost of capital (WACC)",
+        "The dividend discount model",
+        "Growth investing vs. value investing",
+        "Market capitalization and float",
+        "Diversification and portfolio risk",
+        "Modern portfolio theory and the efficient frontier",
+        "Beta and systematic vs. unsystematic risk",
+        "The Capital Asset Pricing Model (CAPM)",
+        "Bond basics and how interest rates affect stock valuations",
+        "Reading earnings reports and management guidance",
+        "Common behavioral biases in investing",
+    ],
+}
 
 # ── database ─────────────────────────────────────────────────────────────────
 def db():
@@ -55,7 +136,8 @@ def init_db():
             streak INTEGER DEFAULT 0, streak_day TEXT);
         CREATE TABLE IF NOT EXISTS decks(
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER,
-            name TEXT, topic TEXT, level TEXT, kind TEXT, lang TEXT);
+            name TEXT, topic TEXT, level TEXT, kind TEXT, lang TEXT,
+            syllabus_key TEXT, syllabus_idx INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS cards(
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, deck_id INTEGER,
             front TEXT, back TEXT, example TEXT, hint TEXT, created REAL,
@@ -64,7 +146,32 @@ def init_db():
         CREATE TABLE IF NOT EXISTS newlog(
             chat_id INTEGER, deck_id INTEGER, last_new TEXT,
             PRIMARY KEY(chat_id, deck_id));
+        CREATE TABLE IF NOT EXISTS usage(
+            day TEXT PRIMARY KEY, requests INTEGER DEFAULT 0,
+            prompt_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0);
         """)
+        # migrate older DBs that predate the syllabus columns
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(decks)").fetchall()}
+        if "syllabus_key" not in cols:
+            c.execute("ALTER TABLE decks ADD COLUMN syllabus_key TEXT")
+        if "syllabus_idx" not in cols:
+            c.execute("ALTER TABLE decks ADD COLUMN syllabus_idx INTEGER DEFAULT 0")
+
+def record_usage(prompt_tok, output_tok, total_tok):
+    day = today_str()
+    with db() as c:
+        c.execute("INSERT INTO usage(day,requests,prompt_tokens,output_tokens,total_tokens) "
+                  "VALUES(?,1,?,?,?) ON CONFLICT(day) DO UPDATE SET "
+                  "requests=requests+1, prompt_tokens=prompt_tokens+?, "
+                  "output_tokens=output_tokens+?, total_tokens=total_tokens+?",
+                  (day, prompt_tok, output_tok, total_tok, prompt_tok, output_tok, total_tok))
+
+def get_usage(day=None):
+    day = day or today_str()
+    with db() as c:
+        r = c.execute("SELECT * FROM usage WHERE day=?", (day,)).fetchone()
+        return r or {"day": day, "requests": 0, "prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 def ensure_user(chat_id):
     with db() as c:
@@ -95,9 +202,23 @@ def active_deck(chat_id):
 def add_deck(chat_id, d):
     with db() as c:
         cur = c.execute(
-            "INSERT INTO decks(chat_id,name,topic,level,kind,lang) VALUES(?,?,?,?,?,?)",
-            (chat_id, d["name"], d["topic"], d["level"], d["kind"], d.get("lang")))
+            "INSERT INTO decks(chat_id,name,topic,level,kind,lang,syllabus_key,syllabus_idx) VALUES(?,?,?,?,?,?,?,0)",
+            (chat_id, d["name"], d["topic"], d["level"], d["kind"], d.get("lang"), d.get("syllabus_key")))
         return cur.lastrowid
+
+def syllabus_progress(deck):
+    """Return (current_topic_or_None, done_count, total_count) for a deck's syllabus."""
+    key = deck["syllabus_key"] if deck else None
+    if not key or key not in SYLLABI:
+        return None, 0, 0
+    topics = SYLLABI[key]
+    idx = deck["syllabus_idx"] or 0
+    current = topics[idx] if idx < len(topics) else None
+    return current, idx, len(topics)
+
+def advance_syllabus(deck_id):
+    with db() as c:
+        c.execute("UPDATE decks SET syllabus_idx = syllabus_idx + 1 WHERE id=?", (deck_id,))
 
 def deck_cards(chat_id, deck_id):
     with db() as c:
@@ -186,44 +307,44 @@ def fmt_days(d):
 def preview(card, rating):
     return "<10m" if rating == "again" else fmt_days(schedule(card, rating, 0)["interval"])
 
-# ── Groq ──────────────────────────────────────────────────────────────────────
-def _groq_sync(system, user, json_out=True):
-    key = os.environ["GROQ_API_KEY"]
-    url = "https://api.groq.com/openai/v1/chat/completions"
+# ── Gemini ────────────────────────────────────────────────────────────────────
+def _gemini_sync(system, user, json_out=True):
+    key = os.environ["GEMINI_API_KEY"]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.9,
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig": ({"responseMimeType": "application/json", "temperature": 0.9}
+                             if json_out else {"temperature": 0.9}),
     }
-    if json_out:
-        body["response_format"] = {"type": "json_object"}
-    r = requests.post(url, headers={"Content-Type": "application/json",
-                                     "Authorization": f"Bearer {key}"},
-                      json=body, timeout=40)
+    r = requests.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": key},
+                      json=body, timeout=60)
     if r.status_code != 200:
         detail = ""
         try: detail = r.json().get("error", {}).get("message", "")
         except Exception: pass
         if r.status_code == 429:
-            raise RuntimeError("Hit the Groq free-tier rate limit — try again in a minute.")
-        if r.status_code == 401:
-            raise RuntimeError("Groq API key was rejected — check GROQ_API_KEY.")
-        raise RuntimeError(f"Groq error {r.status_code}: {detail}")
+            raise RuntimeError("Hit the Gemini free-tier rate limit — try again in a minute, or check /usage.")
+        if r.status_code in (400, 403):
+            raise RuntimeError("Gemini API key was rejected — check GEMINI_API_KEY.")
+        raise RuntimeError(f"Gemini error {r.status_code}: {detail}")
     data = r.json()
-    return data["choices"][0]["message"]["content"]
+    usage = data.get("usageMetadata", {})
+    record_usage(usage.get("promptTokenCount", 0),
+                  usage.get("candidatesTokenCount", 0),
+                  usage.get("totalTokenCount", 0))
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts)
 
-async def groq(system, user, json_out=True):
-    return await asyncio.to_thread(_groq_sync, system, user, json_out)
+async def gemini(system, user, json_out=True):
+    return await asyncio.to_thread(_gemini_sync, system, user, json_out)
 
 def parse_json(text):
     t = text.replace("```json", "").replace("```", "").strip()
     a, b = t.find("{"), t.rfind("}")
     return json.loads(t[a:b+1] if a >= 0 else t)
 
-async def gen_card(deck, existing_fronts):
+async def gen_card(deck, existing_fronts, syllabus_topic=None, syllabus_done=False):
     avoid = ("Do NOT repeat any of these already-covered items: "
              + "; ".join(existing_fronts[-40:]) + ".") if existing_fronts else ""
     if deck["kind"] == "vocab":
@@ -234,23 +355,40 @@ async def gen_card(deck, existing_fronts):
                  f"back = English meaning plus part of speech, "
                  f"example = a natural short sentence in {lang} using the word (add a reading/translation if the script isn't Latin), "
                  f"hint = a brief memory aid.")
+    elif deck["kind"] == "lesson":
+        shape = (f"front = the name of today's concept/topic — use exactly this: '{syllabus_topic}'" if syllabus_topic else
+                 "front = the name of the concept/topic for today (specific, not generic — e.g. "
+                 "'Value at Risk (VaR)' not 'risk metrics'), ")
+        shape += (" back = a thorough explanation in 3-5 short paragraphs (roughly 150-250 words total) covering "
+                 "what it is, why it matters, and how it's used or calculated in practice — written like a study "
+                 "note for someone preparing for an exam or professional role, "
+                 "example = a concrete worked example, case study, or scenario that applies the concept, "
+                 "hint = one sentence: the key takeaway or exam tip to remember.")
     else:
         shape = ("front = the term or concept name, back = a clear 1-2 sentence explanation, "
                  "example = a concrete example or tiny code snippet that makes it click, "
                  "hint = a one-line intuition.")
     system = ("You are a precise, encouraging tutor building ONE spaced-repetition flashcard. "
               "Reply with ONLY a JSON object with keys: front, back, example, hint. Keep each field tight.")
-    user = (f"Topic: {deck['topic']}. Level: {deck['level']}. "
-            f"Make one genuinely useful, NEW flashcard. {shape} {avoid}")
-    return parse_json(await groq(system, user))
+    if syllabus_topic:
+        user = f"Topic: {deck['topic']}. Level: {deck['level']}. {shape}"
+    elif syllabus_done:
+        user = (f"Topic: {deck['topic']}. Level: {deck['level']}. The learner has finished the core curriculum "
+                f"sequence. Make one genuinely useful bonus/advanced flashcard that reinforces or extends it — "
+                f"e.g. a case study, a trickier edge case, or a synthesis across topics. {shape} {avoid}")
+    else:
+        user = (f"Topic: {deck['topic']}. Level: {deck['level']}. "
+                f"Make one genuinely useful, NEW flashcard. {shape} {avoid}")
+    return parse_json(await gemini(system, user))
 
 async def grade(card, answer):
     system = ('You grade a learner\'s recall attempt generously but honestly. '
               'Reply with ONLY JSON: {"correct": boolean, "feedback": string}. '
-              'Feedback is one warm, specific sentence.')
-    user = (f'Prompt shown: "{card["front"]}". Expected answer: "{card["back"]}". '
+              'Feedback is one warm, specific sentence. If the back-of-card text is a longer '
+              'explanation, judge whether the learner captured its core idea, not every detail.')
+    user = (f'Prompt shown: "{card["front"]}". Expected answer/explanation: "{card["back"]}". '
             f'The learner wrote: "{answer}". Was it essentially right?')
-    return parse_json(await groq(system, user))
+    return parse_json(await gemini(system, user))
 
 # ── formatting ────────────────────────────────────────────────────────────────
 def card_front_md(card, tag=""):
@@ -292,6 +430,8 @@ async def cmd_help(update: Update, ctx):
         "/deck — switch subject\n"
         "/newdeck — create a custom subject\n"
         "/stats — streak and your memory horizon\n"
+        "/syllabus — curriculum progress (for GARP RAI, Stocks, etc.)\n"
+        "/usage — today's Gemini request/token count\n"
         "/settime HH:MM — when to send the morning card\n"
         "/cancel — stop the current action",
         parse_mode=ParseMode.HTML)
@@ -315,9 +455,11 @@ async def deliver_new_card(chat, ctx, prefix=""):
     if got_new_today(chat, deck["id"], today_str()):
         prefix = prefix or "Today's seed is already planted — here's one more anyway.\n\n"
     msg = await bot.send_message(chat, prefix + "✦ Drawing a card…")
+    topic, done, total = syllabus_progress(deck)
     try:
         existing = [c["front"] for c in deck_cards(chat, deck["id"])]
-        data = await gen_card(deck, existing)
+        data = await gen_card(deck, existing, syllabus_topic=topic,
+                              syllabus_done=(total > 0 and topic is None))
     except Exception as e:
         return await msg.edit_text(f"Couldn't draw a card: {e}")
     base = {"interval": 0, "ease": 2.5, "reps": 0, "lapses": 0}
@@ -325,9 +467,16 @@ async def deliver_new_card(chat, ctx, prefix=""):
     cid = insert_card(chat, deck["id"], data, sched, now_ts())
     mark_new_today(chat, deck["id"], today_str())
     touch_streak(chat)
+    if topic is not None:
+        advance_syllabus(deck["id"])
+        tag = f"Today · {deck['name']} · {done+1}/{total}"
+    elif total:
+        tag = f"Today · {deck['name']} · bonus (syllabus complete)"
+    else:
+        tag = f"Today · {deck['name']}"
     card = get_card(cid)
     await msg.edit_text(
-        card_front_md(card, f"Today · {deck['name']}"),
+        card_front_md(card, tag),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Show answer", callback_data=f"show:{cid}")]]))
 
@@ -385,6 +534,30 @@ async def cmd_settime(update: Update, ctx):
     await update.message.reply_text(
         f"Morning card set for {h:02d}:{m:02d} ({TZ.key}). ☀️")
 
+async def cmd_syllabus(update: Update, ctx):
+    chat = update.effective_chat.id
+    deck = active_deck(chat)
+    if not deck:
+        return await update.message.reply_text("Pick a subject first with /deck.")
+    topic, done, total = syllabus_progress(deck)
+    if not total:
+        return await update.message.reply_text(
+            f"<b>{deck['name']}</b> doesn't follow a fixed syllabus — daily cards are picked freely "
+            f"by the tutor (avoiding repeats).", parse_mode=ParseMode.HTML)
+    bar_len = 20
+    filled = round(bar_len * done / total)
+    bar = "█"*filled + "░"*(bar_len-filled)
+    lines = [f"<b>{deck['name']} syllabus</b>", f"<code>{bar}</code> {done}/{total} topics covered", ""]
+    if topic:
+        lines.append(f"<b>Next up:</b> {topic}")
+    else:
+        lines.append("<b>Core curriculum complete!</b> Now sending bonus/advanced cards.")
+    syl = SYLLABI[deck["syllabus_key"]]
+    if done > 0:
+        lines.append("")
+        lines.append("<i>Recent:</i> " + ", ".join(syl[max(0, done-3):done]))
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 async def cmd_stats(update: Update, ctx):
     chat = update.effective_chat.id
     deck = active_deck(chat)
@@ -409,6 +582,22 @@ async def cmd_stats(update: Update, ctx):
 async def cmd_cancel(update: Update, ctx):
     ctx.user_data.clear()
     await update.message.reply_text("Cleared. ✦")
+
+async def cmd_usage(update: Update, ctx):
+    u = get_usage()
+    req, tot = u["requests"], u["total_tokens"]
+    pct = min(100, round(100 * req / FREE_RPD_LIMIT)) if FREE_RPD_LIMIT else 0
+    bar_len = 20
+    filled = round(bar_len * pct / 100)
+    bar = "█"*filled + "░"*(bar_len-filled)
+    await update.message.reply_text(
+        f"<b>Gemini usage today</b> ({today_str()}, {TZ.key})\n\n"
+        f"Requests: {req} / {FREE_RPD_LIMIT}\n<code>{bar}</code> {pct}%\n\n"
+        f"Tokens — prompt: {u['prompt_tokens']:,} · output: {u['output_tokens']:,} · total: {tot:,}\n\n"
+        f"<i>This is a local counter the bot keeps from each API response, not a live read of "
+        f"Google's quota — there's no endpoint for that. Free-tier limits can change; check "
+        f"aistudio.google.com for the current ceiling on {MODEL}.</i>",
+        parse_mode=ParseMode.HTML)
 
 # ── callback queries ──────────────────────────────────────────────────────────
 async def on_callback(update: Update, ctx):
@@ -488,11 +677,15 @@ async def on_text(update: Update, ctx):
             return await update.message.reply_text("What should I draw cards from? Describe the topic.")
         if nd["step"] == "topic":
             nd["topic"] = text; nd["step"] = "kind"
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Concepts", callback_data="ndk:concept"),
-                InlineKeyboardButton("Terms", callback_data="ndk:term"),
-                InlineKeyboardButton("Vocab", callback_data="ndk:vocab")]])
-            return await update.message.reply_text("What kind of cards?", reply_markup=kb)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Concepts", callback_data="ndk:concept"),
+                 InlineKeyboardButton("Terms", callback_data="ndk:term")],
+                [InlineKeyboardButton("Vocab", callback_data="ndk:vocab"),
+                 InlineKeyboardButton("Deep lesson 📖", callback_data="ndk:lesson")]])
+            return await update.message.reply_text(
+                "What kind of cards?\n<i>Deep lesson = a few short paragraphs with a worked example "
+                "and exam-style takeaway — good for certifications, investing, etc.</i>",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
         if nd["step"] == "lang":
             nd["lang"] = text; nd["step"] = "level"
             return await update.message.reply_text("Level?", reply_markup=level_keyboard())
@@ -553,7 +746,7 @@ async def on_startup(app: Application):
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    os.environ["GROQ_API_KEY"]  # fail fast if missing
+    os.environ["GEMINI_API_KEY"]  # fail fast if missing
     app = Application.builder().token(token).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -563,6 +756,8 @@ def main():
     app.add_handler(CommandHandler("deck", cmd_deck))
     app.add_handler(CommandHandler("newdeck", lambda u, c: on_callback_newdeck(u, c)))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("syllabus", cmd_syllabus))
+    app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_callback))
