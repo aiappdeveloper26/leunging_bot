@@ -14,11 +14,11 @@ Setup (see the README notes in chat):
   python daybook_bot.py
 """
 
-import os, sqlite3, time, json, random, asyncio, logging, threading, datetime as dt
+import os, sqlite3, time, json, random, asyncio, logging, threading, html, datetime as dt
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -382,16 +382,26 @@ async def gen_card(deck, existing_fronts, syllabus_topic=None, syllabus_done=Fal
                 f"Make one genuinely useful, NEW flashcard. {shape} {avoid}")
     return parse_json(await gemini(system, user))
 
-async def grade(card, answer):
-    system = ('You grade a learner\'s recall attempt generously but honestly. '
-              'Reply with ONLY JSON: {"correct": boolean, "feedback": string}. '
-              'Feedback is one warm, specific sentence. If the back-of-card text is a longer '
-              'explanation, judge whether the learner captured its core idea, not every detail.')
-    user = (f'Prompt shown: "{card["front"]}". Expected answer/explanation: "{card["back"]}". '
-            f'The learner wrote: "{answer}". Was it essentially right?')
-    return parse_json(await gemini(system, user))
+async def gen_quiz_mc(card):
+    system = ('You write a multiple-choice quiz question testing recall of ONE flashcard. '
+              'Reply with ONLY JSON: {"question": string, "options": [string,string,string,string], '
+              '"correct_index": integer 0-3}. Exactly one option must be correct; the other three '
+              'should be plausible but clearly wrong to someone who knows the material — no joke '
+              'or throwaway options. Keep the question and each option short enough to fit on a '
+              'button (aim for under 45 characters each). Base the question on the card below; if '
+              'the back is a long explanation, focus on its single most important fact.')
+    user = f'Front: "{card["front"]}"\nBack: "{card["back"]}"'
+    data = parse_json(await gemini(system, user))
+    options = data.get("options") or []
+    ci = data.get("correct_index")
+    if len(options) != 4 or not isinstance(ci, int) or not (0 <= ci < 4):
+        raise ValueError("Model returned malformed quiz options")
+    return data
 
 # ── formatting ────────────────────────────────────────────────────────────────
+def esc(s):
+    return html.escape(str(s), quote=False)
+
 def card_front_md(card, tag=""):
     head = f"<i>{tag}</i>\n" if tag else ""
     hint = f"\n<i>{card['hint']}</i>" if card["hint"] else ""
@@ -427,7 +437,7 @@ async def cmd_help(update: Update, ctx):
         "<b>Commands</b>\n"
         "/learn — today's new card\n"
         "/review — go through cards that are due\n"
-        "/quiz — get quizzed; type your answer and I'll grade it\n"
+        "/quiz — multiple-choice quiz on a due card\n"
         "/deck — switch subject\n"
         "/newdeck — create a custom subject\n"
         "/stats — streak and your memory horizon\n"
@@ -517,9 +527,23 @@ async def cmd_quiz(update: Update, ctx):
         return await update.message.reply_text("Nothing to quiz yet — /learn a card first.")
     due = due_cards(chat, deck["id"], now_ts())
     card = random.choice(due if due else cards)
-    ctx.user_data["quiz_card"] = card["id"]
-    await update.message.reply_text(
-        card_front_md(card, "Quiz · type your answer"), parse_mode=ParseMode.HTML)
+    msg = await update.message.reply_text("✦ Writing a question…")
+    try:
+        q = await gen_quiz_mc(card)
+    except Exception as e:
+        return await msg.edit_text(f"Couldn't write a quiz question: {e}")
+
+    options, correct = q["options"], q["correct_index"]
+    order = list(range(4))
+    random.shuffle(order)
+    ctx.user_data["quiz"] = {"card_id": card["id"], "correct_pos": order.index(correct)}
+
+    letters = "ABCD"
+    kb = [[InlineKeyboardButton(f"{letters[i]}. {options[order[i]]}", callback_data=f"qz:{card['id']}:{i}")]
+          for i in range(4)]
+    await msg.edit_text(
+        f"<b>Quiz</b> · {esc(card['front'])}\n\n{esc(q['question'])}",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
 async def cmd_settime(update: Update, ctx):
     chat = update.effective_chat.id
@@ -663,6 +687,24 @@ async def on_callback(update: Update, ctx):
             if rating == "again": qq.append(done)   # resurface this session
         return await send_next_review(chat, ctx)
 
+    if data.startswith("qz:"):
+        _, cid, chosen = data.split(":")
+        cid, chosen = int(cid), int(chosen)
+        quiz = ctx.user_data.get("quiz")
+        card = get_card(cid)
+        if not quiz or quiz.get("card_id") != cid or not card:
+            return await q.edit_message_text("This quiz expired — send /quiz for a new one.")
+        is_correct = (chosen == quiz["correct_pos"])
+        rating = "good" if is_correct else "again"
+        update_sched(card["id"], schedule(card, rating, now_ts()))
+        touch_streak(chat)
+        mark = "✅ <b>Correct!</b>" if is_correct else "❌ <b>Not quite.</b>"
+        await q.edit_message_text(
+            f"{mark}\n\n{card_back_md(card)}\n\n<i>scored as {rating} · next in {preview(card, rating)}</i>",
+            parse_mode=ParseMode.HTML)
+        ctx.user_data.pop("quiz", None)
+        return
+
 def level_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton(l, callback_data=f"ndl:{l}")
                                   for l in ("beginner", "intermediate", "advanced")]])
@@ -690,25 +732,6 @@ async def on_text(update: Update, ctx):
         if nd["step"] == "lang":
             nd["lang"] = text; nd["step"] = "level"
             return await update.message.reply_text("Level?", reply_markup=level_keyboard())
-        return
-
-    cid = ctx.user_data.pop("quiz_card", None)
-    if cid:
-        card = get_card(cid)
-        if not card:
-            return await update.message.reply_text("That card vanished — try /quiz again.")
-        thinking = await update.message.reply_text("Checking…")
-        try:
-            g = await grade(card, text)
-            mark = "✅" if g.get("correct") else "❌"
-            rating = "good" if g.get("correct") else "again"
-            update_sched(card["id"], schedule(card, rating, now_ts())); touch_streak(chat)
-            await thinking.edit_text(
-                f"{mark} {g.get('feedback','')}\n\n{card_back_md(card)}\n\n"
-                f"<i>scored as {rating} · next in {preview(card, rating)}</i>",
-                parse_mode=ParseMode.HTML)
-        except Exception as e:
-            await thinking.edit_text(f"Couldn't grade that ({e}).\n\n{card_back_md(card)}", parse_mode=ParseMode.HTML)
         return
 
     await update.message.reply_text("Try /learn, /review, /quiz, or /help.")
@@ -747,6 +770,24 @@ async def on_startup(app: Application):
         await app.bot.delete_webhook(drop_pending_updates=False)
     except Exception as e:
         log.warning("delete_webhook failed (continuing anyway): %s", e)
+    # Register the command menu (the "/" button in Telegram's chat UI).
+    # Without this, commands work but aren't discoverable/autocompleted.
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start",    "Pick a subject / show the home menu"),
+            BotCommand("learn",    "Get today's new card"),
+            BotCommand("review",   "Review cards that are due"),
+            BotCommand("quiz",     "Multiple-choice quiz on a card"),
+            BotCommand("deck",     "Switch subject"),
+            BotCommand("newdeck",  "Create a custom subject"),
+            BotCommand("stats",    "Streak and memory horizon"),
+            BotCommand("syllabus", "Curriculum progress"),
+            BotCommand("usage",    "Today's Gemini request/token usage"),
+            BotCommand("settime",  "Set morning digest time (HH:MM)"),
+            BotCommand("help",     "List all commands"),
+        ])
+    except Exception as e:
+        log.warning("set_my_commands failed (continuing anyway): %s", e)
     for chat in all_user_ids():
         await schedule_digest(app, chat)
     log.info("Daybook ready. Rescheduled digests for %d users.", len(all_user_ids()))
